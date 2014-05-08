@@ -1,20 +1,25 @@
 #include <SFML/Network.hpp>
 #include <SFML/System.hpp>
 #include <memory>
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <fstream>
 #include <vector>
 #include <string>
+#include <queue>
 #include <map>
 #include <chrono>
 #include <ctime>
+
+#define GAME_VERSION "0.1.5"
 
 using namespace std;
 using namespace sf;
                     //0     1     2       3       4         5            6          7          8            9           10     11
 enum class packetID {None, Name, Move, Connect, Login, LoginResponse, GameEnd, Disconnect, Register, RegisterResponse, Chat, GameRequest,
-                    Response, Options, Turn, MatchLog, Check, Checkmate};
+                    Response, Options, Turn, MatchLog, Check, Checkmate, KeepAlive, MoveLog, WrongVersion, PlayerList, CapaGameRequest, CapaConnect, CapaOptions,
+                    GameEndTimeOut};
 enum class statusID {offline, online, playing};
 
 struct userInfo {
@@ -24,7 +29,9 @@ struct userInfo {
     string password;
     string email;
     string registerdata;
-    string status;
+    string active;
+    string matches;
+    statusID status;
     userInfo(string _id, string _username, string _nickname, string _password, string _email, string _registerdata){
         id           = _id;
         username     = _username;
@@ -32,17 +39,10 @@ struct userInfo {
         password     = _password;
         email        = _email;
         registerdata = _registerdata;
-        status       = "1";
+        active       = "1";
+        status       = statusID::offline;
     }
-    userInfo(){}
-};
-
-struct playerInfo {
-    int id;
-    std::string name;
-    statusID status;
-    playerInfo (int _id, std::string _name, statusID _status) {id = _id; name = _name; status = _status;}
-    playerInfo () {}
+    userInfo(){status = statusID::offline;}
 };
 
 
@@ -50,23 +50,32 @@ struct playerInfo {
 
 TcpListener                       listener;
 vector<unique_ptr<TcpSocket>>     players;
-vector<int>                       playersEnemy;
-vector<playerInfo>                playerlist;
 vector<userInfo>                  userlist;
-map<string, string>               accounts;
-map<int, string>                  accountsIDs;
 vector<sf::Clock>                 playersTime;
+
+map<int, int>                     Opponents;
+map<int, string>                  accountsIDs;
+map<string, int>                  IDsAccounts;
+
+
+queue<int>                        classicQueue;
+queue<int>                        capaQueue;
+
+sf::Clock sendListTime;
 
 constexpr int timeout = 120;
 int waitingPlayer;
 int numberOfUsers = 0;
 bool waiting = false;
+int playerID;
+
+
 
 void logHistory (string action, string playerName);
 string getTimestamp();
 
 void loadUserInformation(){
-    ifstream input {"data/users2.dat"};
+    ifstream input {"data/users.dat"};
     string user;
     int i;
     userlist.emplace_back();
@@ -77,7 +86,7 @@ void loadUserInformation(){
           getline(input, userlist[numberOfUsers].password,     ';');
           getline(input, userlist[numberOfUsers].email,        ';');
           getline(input, userlist[numberOfUsers].registerdata, ';');
-          getline(input, userlist[numberOfUsers].status,       ';');
+          getline(input, userlist[numberOfUsers].active,       ';');
           numberOfUsers++;
           if(input.peek() != EOF) userlist.emplace_back();
     }
@@ -86,24 +95,16 @@ void loadUserInformation(){
 void acceptNewPlayers() {
     if (listener.accept(*players.back()) == Socket::Done) {
         players.back()->setBlocking (false);
-        playerlist.emplace_back (static_cast<int>(players.size() - 1), "unknown", statusID::offline);
-        playersEnemy.emplace_back(-1);
         cout << "player " << static_cast<int> (players.size()) << " connected!\n";
         playersTime.emplace_back();
         players.emplace_back (new TcpSocket());
     }
 }
 
-void loadAccounts(){
-    int i;
-    for(i = 0; i < numberOfUsers; i++){
-        accounts[userlist[i].username] = userlist[i].password;
-    }
-}
-
 
 void saveAccounts() {
-    ofstream output {"data/users2.dat"};
+    cout << "Saving users..." << endl;
+    ofstream output {"data/users.dat"};
 
     for (auto& user : userlist)
         output << user.id << ";"
@@ -112,207 +113,394 @@ void saveAccounts() {
                << user.password     << ";"
                << user.email        << ";"
                << user.registerdata << ";"
-               << user.status       << ";";
+               << user.active       << ";\n";
     output << std::flush;
+    cout << "Users data saved!" << endl;
 }
 
 
-void registerAccount2(string username, string nickname, string password, string id, string email) {
+void registerAccount(string username, string password, string nickname, string email) {
     userlist.emplace_back();
-    userlist[numberOfUsers].id          = id;
+    userlist[numberOfUsers].id          = std::to_string(numberOfUsers);
     userlist[numberOfUsers].username    = username;
     userlist[numberOfUsers].nickname    = nickname;
     userlist[numberOfUsers].password    = password;
     userlist[numberOfUsers].email       = email;
-    userlist[numberOfUsers].status      = "1";
+    userlist[numberOfUsers].active      = "1";
     userlist[numberOfUsers].registerdata= getTimestamp();
     numberOfUsers++;
-    accounts[username] = password;
     saveAccounts();
 }
 
-void registerAccount (string ulogin, string upassword) {
-    accounts[ulogin] = upassword;
-    saveAccounts();
-}
 
-void sendLoginResponse (int fromPlayer, string ulogin, string upassword) {
+void sendLoginResponse (int playerID, string ulogin, string upassword, string version) {
     Packet packet;
     int i;
     bool foundUser = false;
+    if(version == GAME_VERSION){
+       for(i = 0; i < userlist.size(); i++){
+            if(userlist[i].username == ulogin){
+                foundUser = true;
+                break;
+            }
+        }
+        if(!foundUser){
+            logHistory ("not found", ulogin);
+            packet << playerID << static_cast<int> (packetID::LoginResponse) << false;
+            players[playerID]->send(packet);
+            return;
+        }
+        if(foundUser && userlist[i].password == upassword){
+            accountsIDs[playerID] = userlist[i].username;
+            IDsAccounts[userlist[i].username] = playerID;
+            userlist[i].status = statusID::online;
+            cout << "Successful login from player " << userlist[i].username << "\n";
+
+            logHistory ("logon", userlist[i].username);
+            packet << playerID << static_cast<int> (packetID::LoginResponse) << true << userlist[i].username;
+            players[playerID]->send(packet);
+            return;
+        }
+        logHistory ("incorrect password", userlist[i].username);
+        packet << playerID << static_cast<int> (packetID::LoginResponse) << false;
+        players[playerID]->send(packet);
+    }
+    else{
+        packet << playerID << static_cast<int> (packetID::WrongVersion);
+        players[playerID]->send(packet);
+    }
+}
+
+void sendRegisterResponse (int fromPlayer, string uusername, string upassword, string unickname, string uemail) { //change to the new style
+    Packet packet;
+    int i;
     for(i = 0; i < userlist.size(); i++){
-        if(userlist[i].username == ulogin){
-            foundUser = true;
-            break;
+        if(userlist[i].username == uusername ||
+           userlist[i].nickname == unickname ||
+           userlist[i].email    == uemail){
+            packet << fromPlayer << static_cast<int> (packetID::RegisterResponse) << false;
+            players[fromPlayer]->send(packet);
+            return;
         }
     }
-    if(foundUser && userlist[i].password == upassword){
-        playerlist[fromPlayer].name = userlist[i].username;
-        playerlist[fromPlayer].status = statusID::online;
-        accountsIDs[fromPlayer] = userlist[i].id;
-        cout << "Successful login from player " << playerlist[fromPlayer].name << "\n";
-
-        logHistory ("logon", playerlist[fromPlayer].name);
-        packet << fromPlayer << static_cast<int> (packetID::LoginResponse) << true;
-        players[fromPlayer]->send(packet);
-        return;
-    }
-    //only goes through here in case of login failure
-    packet << fromPlayer << static_cast<int> (packetID::LoginResponse) << false;
+    registerAccount(uusername, upassword, unickname, uemail);
+    cout << "Successful register from player " << unickname << "\n";
+    logHistory ("new account", unickname);
+    packet << fromPlayer << static_cast<int> (packetID::RegisterResponse) << true;
     players[fromPlayer]->send(packet);
+    return;
 }
 
-void sendRegisterResponse (int fromPlayer, string ulogin, string upassword) { //change to the new style
+void sendPlayerList(){
     Packet packet;
-    auto it = accounts.find (ulogin);
-    if (it == accounts.end()) {
-        registerAccount (ulogin, upassword);
-        cout << "Successful register from player " << fromPlayer << "\n";
+    packet << -1 << static_cast<int> (packetID::PlayerList);
 
-        packet << fromPlayer << static_cast<int> (packetID::RegisterResponse) << true;
-        players[fromPlayer]->send(packet);
-        return;
+    packet << static_cast<int> (userlist.size());
+    for (auto& user : userlist) {
+        packet << user.nickname << static_cast<int> (user.status);
     }
-    //only goes through here in case of register failure
-    packet << fromPlayer << static_cast<int> (packetID::RegisterResponse) << false;
-    players[fromPlayer]->send(packet);
+    for(auto& player : players)
+        player->send(packet);
+
+    cout << "Sended player list!\n";
 }
 
-void sendOptions(int fromPlayer, int toPlayer){
+void sendOptions(int playerID, int toPlayer){
     Packet packet;
-    packet << fromPlayer << static_cast<int> (packetID::Options);
+    packet << playerID << static_cast<int> (packetID::Options);
     players[toPlayer]->send(packet);
     cout << "Sended options to " << toPlayer << endl;
 }
 
-void sendMove(int fromPlayer, int toPlayer, int i, int j, int iP, int jP, bool check){
+void sendCapaOptions(int playerID, int toPlayer){
     Packet packet;
-    packet << fromPlayer << static_cast<int> (packetID::Move);
+    packet << playerID << static_cast<int> (packetID::CapaOptions);
+    players[toPlayer]->send(packet);
+    cout << "Sended options to " << toPlayer << endl;
+}
+
+void sendMove(int playerID, int toPlayer, int i, int j, int iP, int jP, bool check){
+    Packet packet;
+    packet << playerID << static_cast<int> (packetID::Move);
     packet << i << j << iP << jP << check;
     players[toPlayer]->send(packet);
     cout << "Sended move to " << toPlayer << endl;
 }
 
-void sendGameEnd(int fromPlayer, int toPlayer){
+void sendMoveLog(int playerID, int toPlayer, string moveLog){
     Packet packet;
-    packet << fromPlayer << static_cast<int> (packetID::GameEnd);
+    packet << playerID << static_cast<int> (packetID::MoveLog);
+    packet << moveLog;
+    players[toPlayer]->send(packet);
+    cout << "Sended movelog to " << toPlayer << endl;
+
+}
+
+void sendGameEnd(int playerID, int toPlayer){
+    Packet packet;
+    packet << playerID << static_cast<int> (packetID::GameEnd);
 
     players[toPlayer]->send(packet);
-    // if (playerlist[toPlayer].status != statusID::offline)
-    //     playerlist[toPlayer].status = statusID::online;
     cout << "Sended GameEnd to " << toPlayer << endl;
 }
 
-void sendCheckMate(int fromPlayer, int toPlayer){
+void sendCheckMate(int playerID, int toPlayer){
     Packet packet;
-    packet << fromPlayer << static_cast<int> (packetID::Checkmate);
+    packet << playerID << static_cast<int> (packetID::Checkmate);
 
     players[toPlayer]->send(packet);
 
     cout << "Sended CheckMate to " << toPlayer << endl;
 }
 
-void sendGameRequest(int fromPlayer, int toPlayer){
+void sendChatMessage(int playerID, int toPlayer, string msg){
     Packet packet;
-    packet << fromPlayer << static_cast<int>(packetID::GameRequest);
-    for(auto& player : playerlist){
-        if(player.status == statusID::online && player.id != fromPlayer){
-            toPlayer = player.id;
+    packet << playerID << static_cast<int> (packetID::Chat);
+    auto it = accountsIDs.find(playerID);
+    string name = it->second;
+    packet << name + ": " + msg;
+    players[toPlayer]->send(packet);
+}
+
+void sendGameRequest(int playerID, int toPlayer){
+    int i;
+    string name;
+    Packet packet;
+    packet << playerID << static_cast<int>(packetID::GameRequest);
+    auto it = accountsIDs.find(playerID);
+    name = it->second;
+    for(auto& player : userlist){
+        if(player.status == statusID::online){
+            if(player.username != name){
+                auto it2 = IDsAccounts.find(player.username);
+                toPlayer = it2->second;
+            }
+
         }
     }
     players[toPlayer]->send(packet);
     cout << "Sended game request to " << toPlayer << endl;
 }
 
-void handleClientRequest(Packet packet, int pktID, int fromPlayer, int toPlayer) {
+void sendCapaGameRequest(int playerID, int toPlayer){
+    int i;
+    string name;
+    Packet packet;
+    packet << playerID << static_cast<int>(packetID::CapaGameRequest);
+    auto it = accountsIDs.find(playerID);
+    name = it->second;
+    for(auto& player : userlist){
+        if(player.status == statusID::online){
+            if(player.username != name){
+                auto it2 = IDsAccounts.find(player.username);
+                toPlayer = it2->second;
+            }
+
+        }
+    }
+    players[toPlayer]->send(packet);
+    cout << "Sended capagame request to " << toPlayer << endl;
+}
+
+void handleClientRequest(Packet packet, int pktID, int playerID, int toPlayer) {
+    int i;
+    auto it = accountsIDs.find(toPlayer);
+    auto myID = accountsIDs.find(playerID);
+    string movelog;
+    string msg;
     switch (static_cast<packetID> (pktID)) {
         case packetID::Connect :
-            cout << "Estabilishing connection to player " << toPlayer << "...\n";
-            if (playerlist[toPlayer].status == statusID::online) {
-                packet.clear();
-                packet << fromPlayer << static_cast<int> (packetID::Connect);
-                playerlist[fromPlayer].status = playerlist[toPlayer].status = statusID::playing;
-                players[toPlayer]->send(packet);
-                cout << "Connect from player " << fromPlayer << " to player " << toPlayer << "\n";
+            cout << it->first << " : " << it->second << endl;
+            cout << "Estabilishing connection to player " << it->second << "....\n";
+            for(i = 0; i < userlist.size(); i++){
+                if(it->second == userlist[i].username && userlist[i].status == statusID::online){
+                   packet.clear();
+                    packet << playerID << static_cast<int> (packetID::Connect);
 
-                packet.clear();
-                packet << fromPlayer << static_cast<int> (packetID::Turn);
-                players[fromPlayer]->send(packet);
+                    players[toPlayer]->send(packet);
+                    cout << "Connect from player " << playerID << " to player " << toPlayer << "\n";
+                    userlist[i].status = userlist[toPlayer].status = statusID::playing;
+                    packet.clear();
+                    packet << playerID << static_cast<int> (packetID::Turn);
+                    players[playerID]->send(packet);
 
-                playersEnemy[fromPlayer] = toPlayer;
-                playersEnemy[toPlayer] = fromPlayer;
+                    Opponents[playerID] = toPlayer;
+                    Opponents[toPlayer] = playerID;
+                }
             }
+
             break;
         case packetID::Login : {
-            string ulogin, upassword;
-            packet >> ulogin >> upassword;
+            string ulogin, upassword, version;
+            packet >> ulogin >> upassword >> version;
             if(ulogin.size() > 0 && upassword.size() > 0)
-                sendLoginResponse (fromPlayer, ulogin, upassword);
+                sendLoginResponse (playerID, ulogin, upassword, version);
             break;
         }
         case packetID::Register : {
-            string ulogin, upassword;
-            packet >> ulogin >> upassword;
-            sendRegisterResponse(fromPlayer, ulogin, upassword);
+            string uusername, upassword, unickname, uemail;
+            packet >> uusername >> upassword >> unickname >> uemail;
+            sendRegisterResponse(playerID, uusername, upassword, unickname, uemail);
             break;
         }
         case packetID::Move:
             int i, j, iP, jP;
             bool check;
             packet >> i >> j >> iP >> jP >> check;
-            cout << "Movement from player " << fromPlayer << endl;
-            toPlayer = playersEnemy[fromPlayer];
-            sendMove(fromPlayer, toPlayer, i, j, iP, jP, check);
+            cout << "Movement from player " << playerID << endl;
+            toPlayer = Opponents[playerID];
+            sendMove(playerID, toPlayer, i, j, iP, jP, check);
         break;
-        case packetID::Checkmate:
-            toPlayer = playersEnemy[fromPlayer];
-            cout << "Checkmate from player " << fromPlayer << endl;
-            sendCheckMate(fromPlayer, toPlayer);
+
+        case packetID::Chat:
+            packet >> msg;
+            toPlayer = Opponents[playerID];
+            sendChatMessage(playerID, toPlayer, msg);
         break;
+
+        case packetID::Checkmate: {
+                toPlayer = Opponents[playerID];
+                auto it2 = accountsIDs.find(toPlayer);
+                cout << "Checkmate from player " << playerID << endl;
+                sendCheckMate(playerID, toPlayer);
+                for(i = 0; i < userlist.size(); i++){
+                    if(userlist[i].username == myID->second){
+                        userlist[i].status = statusID::online;
+                    }
+                    if(userlist[i].username == it2->second){
+                        userlist[i].status = statusID::online;
+                    }
+                }
+            }
+        break;
+
         case packetID::GameEnd : {
-            cout << "GameEnd from player " << fromPlayer << endl;
-            playerlist[fromPlayer].status = statusID::online;
-            sendGameEnd(fromPlayer, toPlayer);
+            cout << "GameEnd from player " << playerID << endl;
+            for(i = 0; i < userlist.size(); i++){
+                if(userlist[i].username == myID->second){
+                    userlist[i].status = statusID::online;
+                }
+            }
+
+            sendGameEnd(playerID, toPlayer);
         break;
         }
-        case packetID::Disconnect : {
-            cout << "Player " << playerlist[fromPlayer].name << " disconnected\n";
-            if (playerlist[fromPlayer].status == statusID::playing) {
-                sendGameEnd(fromPlayer, playersEnemy[fromPlayer]);
+        case packetID::GameEndTimeOut : {
+            int loserID;
+            packet >> loserID;
+            toPlayer = loserID;
+            cout << "GameEndTimeout from player " << playerID << endl;
+            for(i = 0; i < userlist.size(); i++){
+                if(userlist[i].username == myID->second){
+                    userlist[i].status = statusID::online;
+                }
             }
-            playerlist[fromPlayer].status = statusID::offline; //not ideal... should remove from playerlist
-            players[fromPlayer]->disconnect();
-            logHistory ("logout", playerlist[i].name);
+
+            sendGameEnd(playerID, toPlayer);
+        break;
+        }
+
+        case packetID::PlayerList:
+            sendPlayerList();
+        break;
+
+        case packetID::Disconnect : {
+            auto findDisconnect = accountsIDs.find(playerID);
+            for(i = 0; i < userlist.size(); i++){
+                if(userlist[i].username == findDisconnect->second){
+                    cout << "Player " << userlist[i].username << " disconnected\n";
+                    if (userlist[i].status == statusID::playing) {
+                        sendGameEnd(playerID, Opponents[playerID]);
+                    }
+                    userlist[i].status = statusID::offline;
+                    players[playerID]->disconnect();
+                    //accountsIDs.erase(playerID);
+                    //IDsAccounts.erase(findDisconnect->second);
+                    logHistory ("logout", userlist[i].username);
+                }
+            }
             break;
         }
         case packetID::GameRequest:
-            if(!waiting){
-                waiting = true;
-                waitingPlayer = fromPlayer;
+            if(classicQueue.size() > 0){
+                int enemy = classicQueue.front();
+                classicQueue.pop();
+                cout << "Estabilishing connection to player " << enemy << "...\n";
+                auto findEnemy = accountsIDs.find(enemy);
+                auto findNew = accountsIDs.find(playerID);
+                cout << "enemy name:" << findEnemy->second << endl;
+                for(i = 0; i < userlist.size(); i++){
+                    if(userlist[i].username == findEnemy->second && userlist[i].status == statusID::online){
+                        packet.clear();
+                        packet << playerID << static_cast<int> (packetID::Connect);
+                        players[enemy]->send(packet);
+                        sendOptions(enemy, playerID);
+
+                        packet.clear();
+                        packet << enemy << static_cast<int> (packetID::Connect);
+                        players[playerID]->send(packet);
+                        for(int j = 0; j < userlist.size(); j++){
+                            if(findNew->second == userlist[j].username && userlist[j].status == statusID::online){
+                                cout << "Connect from player " << userlist[j].username << "(" << playerID << ")"
+                                << " to player " << findEnemy->second << "(" << enemy << ")" << "\n";
+                                userlist[j].status = userlist[i].status = statusID::playing;
+                            }
+                        }
+
+                        Opponents[playerID] = enemy;
+                        Opponents[enemy] = playerID;
+                        waiting = false;
+                    }
+                }
+                cout << classicQueue.front() << endl;
             }
-            else{
-                cout << "Estabilishing connection to player " << waitingPlayer << "...\n";
-                if (playerlist[waitingPlayer].status == statusID::online) {
-                    packet.clear();
-                    packet << fromPlayer << static_cast<int> (packetID::Connect);
-                    playerlist[fromPlayer].status = playerlist[waitingPlayer].status = statusID::playing;
-                    players[waitingPlayer]->send(packet);
-                    cout << "Connect from player " << fromPlayer << " to player " << waitingPlayer << "\n";
-                    sendOptions(waitingPlayer, fromPlayer);
-                    packet.clear();
-                    packet << fromPlayer << static_cast<int> (packetID::Connect);
-                    players[fromPlayer]->send(packet);
-                    playersEnemy[fromPlayer] = waitingPlayer;
-                    playersEnemy[waitingPlayer] = fromPlayer;
-                    waiting = false;
+            else classicQueue.push(playerID);
+        break;
+        case packetID::CapaGameRequest:
+            if(capaQueue.size() > 0){
+                int enemy = capaQueue.front();
+                capaQueue.pop();
+                cout << "Estabilishing connection to player " << enemy << "...\n";
+                auto findEnemy = accountsIDs.find(enemy);
+                auto findNew = accountsIDs.find(playerID);
+                cout << "enemy name:" << findEnemy->second << endl;
+                for(i = 0; i < userlist.size(); i++){
+                    if(userlist[i].username == findEnemy->second && userlist[i].status == statusID::online){
+                        packet.clear();
+                        packet << playerID << static_cast<int> (packetID::CapaConnect);
+                        players[enemy]->send(packet);
+                        sendCapaOptions(enemy, playerID);
+
+                        packet.clear();
+                        packet << enemy << static_cast<int> (packetID::CapaConnect);
+                        players[playerID]->send(packet);
+                        for(int j = 0; j < userlist.size(); j++){
+                            if(findNew->second == userlist[j].username && userlist[j].status == statusID::online){
+                                cout << "Connect from player " << userlist[j].username << "(" << playerID << ")"
+                                << " to player " << findEnemy->second << "(" << enemy << ")" << "\n";
+                                userlist[j].status = userlist[i].status = statusID::playing;
+                            }
+                        }
+
+                        Opponents[playerID] = enemy;
+                        Opponents[enemy] = playerID;
+                        waiting = false;
+                    }
                 }
             }
+            else capaQueue.push(playerID);
         break;
         case packetID::MatchLog :
         //    string log;
         //    string player1, player2;
         //    packet >> log;
         //    playersEnemy[fromPlayer];
+        break;
+        case packetID::MoveLog:
+            packet >> movelog;
+            cout << "Movement log from player " << playerID << endl;
+            toPlayer = Opponents[playerID];
+            sendMoveLog(playerID, toPlayer, movelog);
         break;
         default : { //redirect
             if (toPlayer < 0 || toPlayer > players.size() -1) return;
@@ -324,8 +512,9 @@ void handleClientRequest(Packet packet, int pktID, int fromPlayer, int toPlayer)
     }
     //Since a new player might have entered, or 2 of them are now playing,
     //it's necessary to send a packet updating the Playerlist;
-    if (fromPlayer >= 0)
-        playersTime[fromPlayer].restart();
+    if (playerID >= 0)
+        playersTime[playerID].restart();
+
 }
 
 string getTimestamp () {
@@ -336,18 +525,18 @@ string getTimestamp () {
     system_clock::time_point now = system_clock::now();
     time_t now_c = system_clock::to_time_t(now);
     tm now_in = *(localtime(&now_c));
-    output << "["
-           <<  padIt(tm_hour) << ":" << padIt(tm_min) << " "
-           <<  padIt(tm_mday)    << "-"
-           <<  padIt(tm_mon + 1) << "-"
-           <<  now_in.tm_year + 1900
-           << "]";
+    output << ""
+           <<  padIt(tm_mday)    << "/"
+           <<  padIt(tm_mon + 1) << "/"
+           <<  now_in.tm_year + 1900 << " "
+           <<  padIt(tm_hour) << ":" << padIt(tm_min) << ":" << padIt(tm_sec)
+           << "";
     return output.str();
 }
 
 void logHistory (string action, string playerName) {
-    ofstream output {"data/log.dat", ios::app};
-    output << playerName << " " << action << " " << getTimestamp() << "\n";
+    ofstream output {"logs/log.dat", ios::app};
+    output <<  getTimestamp() << " " << playerName << " " << action  << "\n";
     output << std::flush;
 }
 
@@ -358,18 +547,19 @@ void logMatches(string log, string player1, string player2){
 void checkTimeout(){
     int i;
     for (i = 0; i < playersTime.size(); i++) {
-        if((playersTime[i].getElapsedTime().asSeconds() >= timeout) && (playerlist[i].status != statusID::offline)) {
-            if(playerlist[i].status == statusID::playing)
-                sendGameEnd(i, playersEnemy[i]);
-            if(playerlist[playersEnemy[i]].status == statusID::playing)
-                sendGameEnd(playersEnemy[i], i);
+        if((playersTime[i].getElapsedTime().asSeconds() >= timeout) && (userlist[i].status != statusID::offline)) {
+            if(userlist[i].status == statusID::playing)
+                sendGameEnd(i, Opponents[i]);
+            if(userlist[Opponents[i]].status == statusID::playing)
+                sendGameEnd(Opponents[i], i);
 
-            logHistory ("disconected(t.o.)", playerlist[i].name);
-            playerlist[i].status = statusID::offline;
+            logHistory ("disconected(t.o.)", userlist[i].username);
+            userlist[i].status = statusID::offline;
             players[i]->disconnect();
         }
     }
 }
+
 
 int main(){
     int toPlayer, fromPlayer, pktID;
@@ -386,16 +576,20 @@ int main(){
     cout << "Successfully binded to port " << port << endl;
     players.emplace_back (new TcpSocket());
     loadUserInformation();
-    loadAccounts();
+    logHistory ("System initialized at port " + to_string(port), "");
     while (true) {
         acceptNewPlayers();
-        fromPlayer = 0;
-        for (auto& player : players) {
+        playerID = 0;
+        for (auto& player : players){
             if (player->receive(packet) == Socket::Done) {
                 packet >> toPlayer >> pktID;
-                handleClientRequest(packet, pktID, fromPlayer, toPlayer);
+                handleClientRequest(packet, pktID, playerID, toPlayer);
             }
-            ++fromPlayer;
+            playerID++;
+        }
+        if(sendListTime.getElapsedTime().asSeconds() >= 10){
+            sendPlayerList();
+            sendListTime.restart();
         }
        // checkTimeout();
     }
