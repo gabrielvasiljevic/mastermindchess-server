@@ -1,0 +1,8 @@
+Users
+ID; username; nickname; password; e-mail; register data;  active;
+
+Elos
+classic5, 15 and 30 elo & victories, defeats and draws; fischer 5, 15 and 30 elo & victories, defeats and draws; capa5, 15 and 30 elo & victories, defeats and draws;
+
+Matches
+ID; whiteID; blackID; winnerID; eloWon; loserID; eloLost; startTime; endTime; gameMode; gameTime;
